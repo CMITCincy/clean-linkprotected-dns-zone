@@ -1,19 +1,25 @@
 <#
 linkprotect-file-cleaner.ps1
 pellis@cmitsolutions.com
-2026.01.13.002
+2026.10.26.003
 
 .SYNOPSIS
   Clean a DNS zone file for import:
-    - Replace Barracuda LinkProtect URLs with original targets
-    - Remove SOA and NS records (handles multi-line SOA)
-    - Strip 'http://' and 'https://' scheme prefixes from any URLs
+    - Replace Barracuda LinkProtect URLs with original targets (handles nested wrapping)
+    - Restore bare hostnames that LinkProtect turned into https:// links (with trailing dot)
+    - Comment out SOA and NS records for import (handles multi-line SOA)
+    - Strip 'http://' and 'https://' scheme prefixes from record data
+      (comments and quoted TXT strings are left alone)
+    - Preserves original line endings, tabs, and spacing
 
 .PARAMETER InputPath
   Path to the input zone file. Required.
-  
+
 .PARAMETER OutputPath
   Optional. Path to write the cleaned file. If not provided, the input file is overwritten.
+
+.PARAMETER NoTrailingDot
+  Optional. Don't append a trailing '.' to restored hostnames in record data.
 
 .EXAMPLE
   .\Clean-Zone.ps1 -InputPath ".\zonefile.txt"                 # overwrites zonefile.txt
@@ -26,7 +32,9 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$InputPath,
 
-    [string]$OutputPath
+    [string]$OutputPath,
+
+    [switch]$NoTrailingDot
 )
 
 # Fail early if input missing
@@ -35,195 +43,212 @@ if (-not (Test-Path -LiteralPath $InputPath)) {
     exit 1
 }
 
-# Helper: HTML decode (&amp; -> &)
-function Decode-Html {
-    param([string]$s)
-    if ($null -eq $s) { return $null }
-    return [System.Net.WebUtility]::HtmlDecode($s)
-}
+# Wrapped URL candidate. \s excludes tabs and line breaks as well as spaces,
+# so a match can never run past the end of the URL into the rest of the record.
+$LinkProtectRegex = '(?i)https?://linkprotect\.cudasvc\.com/url\?[^\s"''<>()\[\]{}]+'
+$MaxUnwrapDepth   = 10
 
-# Helper: URL percent-decode
-function Decode-Url {
-    param([string]$s)
-    if ($null -eq $s) { return $null }
-    return [System.Uri]::UnescapeDataString($s)
-}
-
-# Extract original URL from a Barracuda LinkProtect URL
+# Unwrap one LinkProtect URL (and any LinkProtect URLs nested inside it)
 function Get-OriginalFrom-LinkProtect {
     param([string]$wrappedUrl)
     if ([string]::IsNullOrWhiteSpace($wrappedUrl)) { return $null }
 
-    $normalized = Decode-Html $wrappedUrl
+    $current = $wrappedUrl
+    for ($depth = 0; $depth -lt $MaxUnwrapDepth; $depth++) {
+        $current = [System.Net.WebUtility]::HtmlDecode($current)   # &amp; -> &
+        if ($current -notmatch '^(?i)https?://linkprotect\.cudasvc\.com/url\?') { break }
 
-    if ($normalized -notmatch '(?i)https?://linkprotect\.cudasvc\.com/url') { return $null }
-
-    # Parse query for 'a=' parameter
-    $query = $null
-    try {
-        $uri = [System.Uri]$normalized
-        $query = $uri.Query.TrimStart('?')
-    } catch {
-        if ($normalized -match '\?(.*)$') { $query = $Matches[1] }
+        # Pull the 'a' parameter. Its value is percent-encoded, so any '&' inside
+        # the original URL is %26 and won't end the match early.
+        if ($current -notmatch '(?i)[?&]a=([^&]*)') { return $null }
+        $current = [System.Uri]::UnescapeDataString($Matches[1])
+        # Loop again: if the decoded value is itself a LinkProtect URL, unwrap it too.
+        # (No blanket second decode here - that would corrupt the inner URL's query.)
     }
-    if ([string]::IsNullOrEmpty($query)) { return $null }
+    return $current
+}
 
-    $query = Decode-Html $query
-    $pairs = $query -split '&'
-    $aValue = $null
-    foreach ($p in $pairs) {
-        if ($p -match '^(?i)a=') {
-            $aValue = $p.Substring(2)
-            break
+# Index of the first ';' that starts a comment (outside quotes), or -1
+function Get-CommentIndex {
+    param([string]$line)
+    $inQuote = $false
+    for ($i = 0; $i -lt $line.Length; $i++) {
+        $ch = $line[$i]
+        if ($ch -eq '\' -and $inQuote) { $i++; continue }
+        if ($ch -eq '"') { $inQuote = -not $inQuote; continue }
+        if ($ch -eq ';' -and -not $inQuote) { return $i }
+    }
+    return -1
+}
+
+# True if position $pos in $line is inside a "quoted string"
+function Test-InQuotes {
+    param([string]$line, [int]$pos)
+    $inQuote = $false
+    for ($i = 0; $i -lt $pos -and $i -lt $line.Length; $i++) {
+        $ch = $line[$i]
+        if ($ch -eq '\' -and $inQuote) { $i++; continue }
+        if ($ch -eq '"') { $inQuote = -not $inQuote }
+    }
+    return $inQuote
+}
+
+# Replace all LinkProtect URLs in one line, using line context to decide formatting
+function Replace-LinkProtectUrlsInLine {
+    param([string]$line)
+    if ([string]::IsNullOrEmpty($line)) { return $line }
+
+    $found = [regex]::Matches($line, $LinkProtectRegex)
+    if ($found.Count -eq 0) { return $line }
+
+    $commentIdx = Get-CommentIndex $line
+    $sb   = New-Object System.Text.StringBuilder
+    $last = 0
+
+    foreach ($m in $found) {
+        [void]$sb.Append($line, $last, $m.Index - $last)
+
+        $original = Get-OriginalFrom-LinkProtect $m.Value
+        if ([string]::IsNullOrWhiteSpace($original)) {
+            $replacement = $m.Value
         }
+        elseif ($original -match '^(?i)https?://([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+)$') {
+            # Scheme + host with no path/slash = a bare hostname LinkProtect auto-linked.
+            $replacement = $Matches[1]
+            $inComment = ($commentIdx -ge 0 -and $m.Index -gt $commentIdx)
+            $inQuotes  = Test-InQuotes $line $m.Index
+            if (-not $NoTrailingDot -and -not $inComment -and -not $inQuotes) {
+                $replacement += '.'   # owner/target names must be FQDNs in a zone file
+            }
+        }
+        else {
+            $replacement = $original  # a real URL; leave it as-is
+        }
+
+        [void]$sb.Append($replacement)
+        $last = $m.Index + $m.Length
     }
-    if ([string]::IsNullOrEmpty($aValue)) { return $null }
-
-    $decoded = Decode-Url $aValue
-    if ($decoded -match '%[0-9A-Fa-f]{2}') { $decoded = Decode-Url $decoded } # handle double encoding
-
-    return $decoded
+    [void]$sb.Append($line, $last, $line.Length - $last)
+    return $sb.ToString()
 }
 
-# Replace all LinkProtect URLs in text with decoded originals
-function Replace-LinkProtectUrlsInText {
-    param([string]$text)
-    if ([string]::IsNullOrEmpty($text)) { return $text }
+# Strip http(s):// from record data only - not comments, not quoted TXT content
+function Strip-HttpSchemesInLine {
+    param([string]$line)
+    if ([string]::IsNullOrEmpty($line)) { return $line }
+    if ($line.TrimStart().StartsWith(';')) { return $line }
 
-    # Find candidate wrapped URLs
-    $regex = '(?i)https?://linkprotect\.cudasvc\.com/url[^ \)\]\}>"' + "'" + ']+' 
+    $commentIdx = Get-CommentIndex $line
+    $dataPart   = if ($commentIdx -ge 0) { $line.Substring(0, $commentIdx) } else { $line }
+    $restPart   = if ($commentIdx -ge 0) { $line.Substring($commentIdx) } else { '' }
 
-    $evaluator = {
-        param([System.Text.RegularExpressions.Match]$m)
-        $wrapped = $m.Value
-        $original = Get-OriginalFrom-LinkProtect -wrappedUrl $wrapped
-        if ([string]::IsNullOrWhiteSpace($original)) { $wrapped } else { $original }
+    # Split on quoted strings; even indexes are outside quotes
+    $parts = [regex]::Split($dataPart, '("(?:\\.|[^"\\])*")')
+    for ($i = 0; $i -lt $parts.Count; $i += 2) {
+        $parts[$i] = [regex]::Replace($parts[$i], '(?i)\bhttps?://', '')
     }
-
-    return [System.Text.RegularExpressions.Regex]::Replace(
-        $text,
-        $regex,
-        [System.Text.RegularExpressions.MatchEvaluator]$evaluator
-    )
+    return (-join $parts) + $restPart
 }
 
-# Strip http:// and https:// scheme prefixes anywhere in the text
-function Strip-HttpSchemes {
-    param([string]$text)
-    if ([string]::IsNullOrEmpty($text)) { return $text }
-    # Remove only the scheme, keep the rest of the URL
-    return [System.Text.RegularExpressions.Regex]::Replace($text, '(?i)\bhttps?://', '')
+# Return the RR type token of a record line, or $null
+# Zone RR format: [owner] [TTL] [CLASS] TYPE RDATA   (TTL/CLASS optional, either order)
+function Get-RecordType {
+    param([string]$recordPart)
+    if ($recordPart -match '^\s*\$') { return $null }           # $ORIGIN / $TTL directives
+    $tokens = @(($recordPart -split '\s+') | Where-Object { $_ -ne '' })
+    if ($tokens.Count -eq 0) { return $null }
+
+    # A line starting with whitespace has no owner field (inherits previous owner)
+    $i = if ($recordPart -match '^\s') { 0 } else { 1 }
+    for ($skip = 0; $skip -lt 2 -and $i -lt $tokens.Count; $skip++) {
+        if ($tokens[$i] -match '^\d+[0-9smhdwSMHDW]*$' -or
+            $tokens[$i] -match '^(?i)(IN|CH|HS|CS)$') { $i++ } else { break }
+    }
+    if ($i -lt $tokens.Count) { return $tokens[$i].ToUpperInvariant() }
+    return $null
 }
 
-# Remove SOA and NS resource records from zone content
-function Remove-SOA-NS-Records {
-    param([string]$text)
+# Comment out SOA and NS resource records (most DNS hosts reject them on import).
+# A note line is added above each run of commented records.
+$ImportNote = ';; Commented out for import usage (SOA/NS are managed by the DNS host)'
 
-    if ([string]::IsNullOrEmpty($text)) { return $text }
+function Comment-SOA-NS-Records {
+    param([string[]]$lines)
 
-    $lines = $text -split "`r?`n", -1
-    $result = New-Object System.Collections.Generic.List[string]
-
-    $inSOABlock = $false
-    $parenDepth = 0
+    $result       = New-Object System.Collections.Generic.List[string]
+    $inSOABlock   = $false
+    $parenDepth   = 0
+    $prevComment  = $false   # was the previous line one we commented out?
 
     foreach ($line in $lines) {
-        # Always keep pure comment lines
-        if ($line.TrimStart().StartsWith(';')) {
-            if (-not $inSOABlock) { $result.Add($line) }
-            continue
-        }
+        $commentIdx = Get-CommentIndex $line
+        $recordPart = if ($commentIdx -ge 0) { $line.Substring(0, $commentIdx) } else { $line }
+        $commentIt  = $false
 
-        # If currently skipping SOA block, update paren depth and continue skipping
         if ($inSOABlock) {
-            # Consider only record part before inline comment
-            $recordPart = ($line -split ';', 2)[0]
-            $openCount  = ([regex]::Matches($recordPart, '\(')).Count
-            $closeCount = ([regex]::Matches($recordPart, '\)')).Count
-            $parenDepth += ($openCount - $closeCount)
-            if ($parenDepth -le 0) {
-                # SOA block ended
-                $inSOABlock = $false
-                $parenDepth = 0
+            # Continuation lines of a multi-line SOA ( ... )
+            $parenDepth += ([regex]::Matches($recordPart, '\(')).Count - ([regex]::Matches($recordPart, '\)')).Count
+            if ($parenDepth -le 0) { $inSOABlock = $false; $parenDepth = 0 }
+            $commentIt = $true
+        }
+        else {
+            $type = Get-RecordType $recordPart
+            if ($type -eq 'NS') { $commentIt = $true }
+            elseif ($type -eq 'SOA') {
+                $parenDepth = ([regex]::Matches($recordPart, '\(')).Count - ([regex]::Matches($recordPart, '\)')).Count
+                $inSOABlock = ($parenDepth -gt 0)
+                if (-not $inSOABlock) { $parenDepth = 0 }
+                $commentIt = $true
             }
-            # Skip this line
-            continue
         }
 
-        # Inspect record part (ignore inline comments after ';')
-        $recordPart = ($line -split ';', 2)[0]
-        $tokens = ($recordPart -split '\s+') | Where-Object { $_ -ne '' }
-
-        if ($tokens.Count -eq 0) {
-            # Blank or whitespace line
+        if ($commentIt) {
+            if (-not $prevComment) { $result.Add($ImportNote) }
+            $result.Add('; ' + $line)
+        } else {
             $result.Add($line)
-            continue
         }
-
-        # Find if this line declares SOA or NS as a type token
-        # Zone RR format: <owner> [TTL] [CLASS] TYPE RDATA...
-        $typeIndex = $null
-        for ($i = 0; $i -lt $tokens.Count; $i++) {
-            $tok = $tokens[$i]
-            # TYPE is one of known RR types. We specifically seek SOA or NS.
-            if ($tok -match '^(?i)SOA$') { $typeIndex = $i; break }
-            if ($tok -match '^(?i)NS$')  { $typeIndex = $i; break }
-        }
-
-        if ($typeIndex -ne $null) {
-            $typeTok = $tokens[$typeIndex].ToUpperInvariant()
-
-            if ($typeTok -eq 'NS') {
-                # Skip NS record line
-                continue
-            }
-            elseif ($typeTok -eq 'SOA') {
-                # Begin skipping SOA block, including possible multi-line parentheses
-                $openCount  = ([regex]::Matches($recordPart, '\(')).Count
-                $closeCount = ([regex]::Matches($recordPart, '\)')).Count
-                $parenDepth = $openCount - $closeCount
-                if ($parenDepth -gt 0) {
-                    $inSOABlock = $true
-                } else {
-                    # One-line SOA without parentheses, just skip this line
-                    $inSOABlock = $false
-                    $parenDepth = 0
-                }
-                continue
-            }
-        }
-
-        # If no SOA or NS detected, keep the line
-        $result.Add($line)
+        $prevComment = $commentIt
     }
-
-    # Join back with original newline semantics (use the predominant newline found)
-    return ($result -join "`n")
+    return ,$result.ToArray()
 }
 
-# Read whole file
+# Read whole file (detects BOM/encoding)
 try {
-    $content = Get-Content -LiteralPath $InputPath -Raw
+    $fullInput = (Resolve-Path -LiteralPath $InputPath).ProviderPath
+    $content   = [System.IO.File]::ReadAllText($fullInput)
 } catch {
     Write-Error "Failed to read input file: $($_.Exception.Message)"
     exit 1
 }
 
-# 1) Decode Barracuda LinkProtect URLs
-$content = Replace-LinkProtectUrlsInText -text $content
+# Preserve the file's own line endings and whether it ended with a newline
+$newline        = if ($content -match "`r`n") { "`r`n" } else { "`n" }
+$endsWithNewline = $content -match "(`r?`n)$"
+if ($endsWithNewline) { $content = $content -replace "(`r?`n)$", '' }
+$lines = [regex]::Split($content, "`r?`n")   # (-split "x", -1 behaves differently in PS 5.1 vs 7)
 
-# 2) Remove SOA and NS records
-$content = Remove-SOA-NS-Records -text $content
+# 1) Decode Barracuda LinkProtect URLs (line by line - never crosses line boundaries)
+$lines = @($lines | ForEach-Object { Replace-LinkProtectUrlsInLine $_ })
 
-# 3) Strip http:// and https:// prefixes
-$content = Strip-HttpSchemes -text $content
+# 2) Comment out SOA and NS records
+$lines = Comment-SOA-NS-Records -lines $lines
+
+# 3) Strip http:// and https:// prefixes from record data
+$lines = @($lines | ForEach-Object { Strip-HttpSchemesInLine $_ })
+
+$output = ($lines -join $newline)
+if ($endsWithNewline) { $output += $newline }
 
 # Decide output target
-$targetPath = if ([string]::IsNullOrWhiteSpace($OutputPath)) { $InputPath } else { $OutputPath }
+$targetPath = if ([string]::IsNullOrWhiteSpace($OutputPath)) { $fullInput } else { $OutputPath }
 
-# Write out
+# Write out (UTF-8, no BOM, no extra newline added)
 try {
-    Set-Content -LiteralPath $targetPath -Value $content
+    if (-not [System.IO.Path]::IsPathRooted($targetPath)) {
+        $targetPath = Join-Path (Get-Location).ProviderPath $targetPath
+    }
+    [System.IO.File]::WriteAllText($targetPath, $output, (New-Object System.Text.UTF8Encoding($false)))
     Write-Host ("Wrote cleaned zone to: {0}" -f $targetPath)
 } catch {
     Write-Error "Failed to write output: $($_.Exception.Message)"
